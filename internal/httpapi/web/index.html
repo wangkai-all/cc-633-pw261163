@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DNS 区数据采集站</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div>
+        <h1>DNS 区数据采集站</h1>
+        <p class="subtitle" v-if="overview.serverAddr">
+          权威测试服务器 <code>{{ overview.serverAddr }}</code>（TCP/UDP）·
+          网页 API <code>/api</code> · 数据随传送实时更新
+        </p>
+      </div>
+      <button class="btn" @click="refreshAll" :disabled="loading">{{ loading ? '刷新中…' : '刷新' }}</button>
+    </header>
+
+    <div v-if="error" class="banner error" @click="error = null">{{ error }} ✕</div>
+    <div v-if="notice" class="banner ok" @click="notice = null">{{ notice }} ✕</div>
+
+    <!-- 测试服务器行为开关 -->
+    <section class="panel">
+      <h2>测试服务器行为开关
+        <span class="hint">用于制造各类异常，验证采集站的校验与拒收逻辑</span>
+      </h2>
+      <div class="behaviors" v-if="overview.behaviors">
+        <label class="behavior" v-for="b in behaviorDefs" :key="b.key" :title="b.tip">
+          <input type="checkbox" :checked="overview.behaviors[b.key]" @change="toggleBehavior(b.key, $event.target.checked)">
+          <span class="bname">{{ b.name }}</span>
+          <span class="bdesc">{{ b.desc }}</span>
+        </label>
+      </div>
+    </section>
+
+    <div class="layout">
+      <!-- 测试区列表 -->
+      <section class="panel zones">
+        <h2>测试区 <span class="hint">选择区后发起全量或增量传送</span></h2>
+        <div v-for="z in zoneRows" :key="z.name" class="zone-card" :class="{active: selectedZone === z.name}" @click="selectZone(z.name)">
+          <div class="zone-head">
+            <span class="zone-name">{{ z.name }}</span>
+            <span class="badge" :class="z.statusClass">{{ z.statusText }}</span>
+          </div>
+          <div class="zone-meta">
+            <div>服务器：序列号 <b>{{ z.serverSerial }}</b> · 版本 {{ z.cur + 1 }}/{{ z.count }}
+              <span v-if="!z.keepHistory" class="tag warn">不留历史·只给全量</span>
+            </div>
+            <div>本地：<template v-if="z.hasCopy">序列号 <b>{{ z.localSerial }}</b> · {{ z.snapshotNum }} 份快照</template>
+              <template v-else><span class="tag">无副本</span></template>
+              <template v-if="z.failedNum > 0"> · <span class="tag bad">{{ z.failedNum }} 次失败</span></template>
+            </div>
+          </div>
+          <div class="zone-actions" @click.stop>
+            <button class="btn primary" @click="doTransfer(z.name, 'axfr')">全量传送</button>
+            <button class="btn primary" @click="doTransfer(z.name, 'ixfr')" :disabled="!z.hasCopy" :title="z.hasCopy ? '' : '本地无副本，请先全量传送'">增量传送</button>
+            <button class="btn" @click="doBump(z.name)" :disabled="!z.canBump" :title="z.canBump ? '推进服务器上的区版本' : '已是最新版本'">推进版本</button>
+            <button class="btn danger" @click="doClear(z.name)" :disabled="!z.hasCopy">清除副本</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 主视图 -->
+      <section class="panel main">
+        <div class="tabs">
+          <button v-for="t in tabs" :key="t.key" class="tab" :class="{on: tab === t.key}" @click="tab = t.key">{{ t.name }}</button>
+        </div>
+
+        <!-- 区内容 -->
+        <div v-show="tab === 'zone'">
+          <div v-if="!selectedZone" class="empty">← 请先在左侧选择一个测试区</div>
+          <template v-else>
+            <div class="toolbar">
+              <label>查看版本：
+                <select v-model="viewSerial" @change="loadSnapshot">
+                  <option :value="null">当前（{{ currentSerialText }}）</option>
+                  <option v-for="s in snapshots" :key="s.serial" :value="s.serial">
+                    序列号 {{ s.serial }} · {{ fmtTime(s.takenAt) }} · 传送 #{{ s.transferId }}
+                  </option>
+                </select>
+              </label>
+              <span v-if="snapshot && viewSerial !== null && viewSerial !== currentSerial" class="tag warn">正在查看旧区（旧区一直可查询）</span>
+              <button class="btn" @click="downloadZone" :disabled="!snapshot">下载规范化结果</button>
+            </div>
+            <div v-if="snapshot" class="zoneview">
+              <div class="zoneview-head">
+                区 <code>{{ snapshot.zone }}</code> · 序列号 <b>{{ snapshot.serial }}</b> ·
+                采集于 {{ fmtTime(snapshot.takenAt) }}（传送 #{{ snapshot.transferId }}）· {{ snapshot.rrsets.length }} 个记录集
+              </div>
+              <rrset-table :rrsets="snapshot.rrsets" :transfers="transfers"></rrset-table>
+            </div>
+            <div v-else class="empty">本地没有该区副本，请先在左侧发起「全量传送」。</div>
+          </template>
+        </div>
+
+        <!-- 传送记录 -->
+        <div v-show="tab === 'transfers'">
+          <transfer-list :transfers="transfers" :selected-id="detail && detail.id" @select="loadTransfer"></transfer-list>
+        </div>
+
+        <!-- 失败检查 -->
+        <div v-show="tab === 'failed'">
+          <div v-if="failedTransfers.length === 0" class="empty">没有失败的传送记录。</div>
+          <transfer-list v-else :transfers="failedTransfers" :selected-id="detail && detail.id" @select="loadTransfer"></transfer-list>
+        </div>
+
+        <!-- 传送详情 -->
+        <transfer-detail v-if="detail" :detail="detail" @close="detail = null"></transfer-detail>
+      </section>
+    </div>
+  </div>
+
+  <script src="/vendor/vue.global.prod.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
